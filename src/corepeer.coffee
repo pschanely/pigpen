@@ -15,18 +15,18 @@ checkStream = (stream, callback) ->
     return stream
 
 log = (args...) -> console.log(args...)
-                        
+
 class CoordServer
     constructor: () ->
     initAction: (user, method, key, data) -> # data undefined in the 'DELETE' case
-        
+
 class CoordinatorProxy
     constructor: (@url, @userid, @password) ->
-        
+
     req: (method, args, kw) ->
         log 'Coordinator request', {method:method, args:args, kw:kw, baseurl:@url}
         args = [@userid, @password].concat(args)
-        req = 
+        req =
             url: @url + '/' + method
             form: {a:JSON.stringify(args),kw:JSON.stringify(kw or {})}
             method: 'POST'
@@ -42,20 +42,26 @@ class CoordinatorProxy
         )
         return deferred.promise
 
+
+mapPortWithPnp = (extPort) ->
+    client = natpmp.connect('192.168.2.1');
+    client.externalIp( (err, info) ->
+        if (err) then throw err
+        log('Current external IP address: %s', info.ip.join('.'))
+    );
+    client.portMapping({ private: @localPort, public: extPort, ttl: 3600 }, (err, info) ->
+        if (err) then throw err;
+        log(info)
+    )
+
+
+
+
 class PeerServer
     constructor: (@coord, @localPort, @extPortRange) ->
-        
+
     start: (retry_wait) ->
         retry_wait ?= 4
-        #client = natpmp.connect('192.168.2.1');
-        #client.externalIp( (err, info) ->
-        #    if (err) then throw err
-        #    log('Current external IP address: %s', info.ip.join('.'))
-        #);
-        #client.portMapping({ private: @localPort, public: extPort, ttl: 3600 }, (err, info) ->
-        #    if (err) then throw err;
-        #    log(info)
-        #)
         [minExtPort, maxExtPort] = @extPortRange
         extPort = maxExtPort + Math.floor(Math.random() * (1 + maxExtPort - minExtPort))
         client = natUpnp.createClient()
@@ -77,11 +83,11 @@ class PeerServer
             )
             #http.Server(@serve).start() # or ... use the real node.js one, since we're using streams
         )
-        
+
     ping: (req, res) ->
         res.writeHead(200)
         res.end(JSON.stringify({result:'OK'}))
-        
+
     serve: (req, res) ->
         if req.url[0] != '/' then throw new Error()
         key = req.url[1...]
@@ -107,11 +113,11 @@ class PeerServer
 
 class PigpenApi
     constructor: (@coord) ->
-        
+
     openStream: (method, ukey, estLen, hashobject) ->
         @coord.req('req_act', [method, ukey, estLen], {})
         .then((response) => @openStreamContinuation(method, response, hashobject))
-        
+
     openStreamContinuation: (method, response, hashobject) ->
         # hashobject.update(response['hashinit']) #TODO
         log 'Coordinator responds to request: ', response
@@ -130,7 +136,7 @@ class PigpenApi
             okcb = -> if err then deferred.reject(err) else deferred.resolve()
             errcb = (fin_err) -> deferred.reject(fin_err)
             @coord.req('fin_act', [method, key, auth, sz, hashobject.read(), status]).then(okcb, errcb)
-        
+
         reqStream.on('data', (chunk) ->
             log 'response? data chunk : ', chunk
             sz += chunk.length)
@@ -146,17 +152,16 @@ class PigpenApi
             stream.pipe(hasher).pipe(putstream)
             return putstream.completionPromise
         )
-        
+
     get: (stream, key) ->
         hasher = makeHasher()
         @openStream('GET', key, estLen, hasher).then((getstream) ->
             getstream.pipe(hasher).pipe(stream); getstream.completionPromise)
-        
+
     delete: (key) ->
-        @openStream('DELETE', key, estLen).then((stream) -> 
+        @openStream('DELETE', key, estLen).then((stream) ->
             stream.completionPromise)
 
 exports.CoordinatorProxy = CoordinatorProxy
 exports.PigpenApi = PigpenApi
 exports.PeerServer = PeerServer
-
