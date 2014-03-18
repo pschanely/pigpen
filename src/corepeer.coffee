@@ -6,8 +6,21 @@ request = require('request')
 crypto = require('crypto')
 natUpnp = require('nat-upnp')
 natpmp = require('nat-pmp')
+stream = require('stream')
+traceroute = require('traceroute')
 
-makeHasher = -> crypto.createHash('sha1')
+makeHasher = ->
+    xform = new stream.Transform( { objectMode: true } )
+    sz = 0
+    hsh = crypto.createHash('sha1')
+    xform._transform = (chunk, encoding, done) ->
+        sz += chunk.length
+        hsh.update(chunk)
+        this.push(chunk)
+        done()
+    xform.getHash = () -> hsh.digest('hex')
+    xform.getSize = () -> sz
+    return xform
 
 checkStream = (stream, callback) ->
     stream.on('end', callback)
@@ -43,45 +56,64 @@ class CoordinatorProxy
         return deferred.promise
 
 
-mapPortWithPnp = (extPort) ->
-    client = natpmp.connect('192.168.2.1');
-    client.externalIp( (err, info) ->
-        if (err) then throw err
-        log('Current external IP address: %s', info.ip.join('.'))
-    );
-    client.portMapping({ private: @localPort, public: extPort, ttl: 3600 }, (err, info) ->
-        if (err) then throw err;
-        log(info)
+mapPortWithUpnp = (localPort, extPort) ->
+    deferred = Q.defer();
+    client = natUpnp.createClient()
+    client.portMapping({
+        public: extPort,
+        private: @localPort,
+        ttl: 0 # unlimited
+    }, (err, info) =>
+        if err then return deferred.reject(err)
+        deferred.resolve([extPort, {method:'upnp', info:info}])
     )
+    return deferred.promise
 
-
-
+mapPortWithNatPnp = (localPort, extPort) ->
+    deferred = Q.defer();
+    gateway = traceroute.trace('millstonecw.com', {maxHops:1}, (err, hops) ->
+        if (err) then return deferred.reject(err)
+        gateway = Object.keys(hops[0])[0]
+        client = natpmp.connect(gateway)
+        client.externalIp( (err, info) ->
+            if (err) then return deferred.reject(err)
+            ext_ip = info.ip.join('.')
+            client.portMapping({ private: localPort, public: extPort, ttl: 3600 }, (err, info) ->
+                if (err) then return deferred.reject(err)
+                deferred.resolve([info.public, {method:'pnp', gateway:gateway, info:info}])
+            )
+        )
+    )
+    return deferred.promise
 
 class PeerServer
     constructor: (@coord, @localPort, @extPortRange) ->
 
-    start: (retry_wait) ->
-        retry_wait ?= 4
+    start: () ->
+        http.createServer(connect()
+            .use('/serve', (req,res) => @serve(req, res))
+            .use('/ping', @ping)
+        ).listen(@localPort)
+        @expose(4)
+        
+    expose: (retry_wait) ->
         [minExtPort, maxExtPort] = @extPortRange
-        extPort = maxExtPort + Math.floor(Math.random() * (1 + maxExtPort - minExtPort))
-        client = natUpnp.createClient()
-        client.portMapping({
-            public: extPort,
-            private: @localPort,
-            ttl: 0 # unlimited
-        }, (err, extra) =>
-            if err
-                log 'ERROR: Unable to map ports', {err: err}
-                extPort = @localPort
-            else
-                log 'Port mapped', {internal: @localPort, external: extPort, extra: extra}
-            http.createServer(connect().use('/serve', (req,res) => @serve(req, res)).use('/ping', @ping)).listen(@localPort)
-            @coord.req('update_peer', [], {determine_host:true, port: extPort}).then((ping_error) =>
+        attemptedExtPort = minExtPort + Math.floor(Math.random() * (1 + maxExtPort - minExtPort))
+
+        # upnp is the most common:
+        promise = mapPortWithUpnp(@localPort, attemptedExtPort)
+        # used by Apple's airport routers:
+        promise = promise.fail(=> mapPortWithNatPnp(@localPort, attemptedExtPort))
+        # Maybe we aren't NAT'ed at all?:
+        promise = promise.fail(=> [@localPort, {method:'no NAT'}])
+        promise.then( (pair) =>
+            [realExtPort, info] = pair
+            console.log 'Requesting server to ping us at ', realExtPort, '; map info: ', info
+            @coord.req('update_peer', [], {determine_host:true, port: realExtPort}).then((ping_error) =>
                 if ping_error != ''
                     log 'Share port not externally visible', {retry_seconds:retry_wait}
-                    setTimeout((=> @start(retry_wait * 1.5)), retry_wait * 1000)
+                    setTimeout((=> @expose(retry_wait * 1.5)), retry_wait * 1000)
             )
-            #http.Server(@serve).start() # or ... use the real node.js one, since we're using streams
         )
 
     ping: (req, res) ->
@@ -91,6 +123,7 @@ class PeerServer
     serve: (req, res) ->
         if req.url[0] != '/' then throw new Error()
         key = req.url[1...]
+        hasher = makeHasher()
         log 'Inbound request', {key:key, headers:req.headers}
         auth = req.headers['x-pigpen-auth']
         @coord.req('chk_act', [req.host, req.method, key, auth]).then( (response) =>
@@ -101,14 +134,15 @@ class PeerServer
             callback = (err) =>
                 log '311', @coord, 'err:', err
                 status = if err then err else 'OK'
-                @coord.req('fin_act', [req.method, key, auth, sz, hsh, status]).done()
+                @coord.req('fin_act', [req.method, key, auth, hasher.getSize(), hasher.getHash(), status]).done()
                 return (res.writeHead(200); res.end())
             switch req.method
                 when 'PUT'
-                    log 'PUTTIN!'
-                    checkStream(req, callback).pipe(fs.createWriteStream(key))
-                when 'GET' then checkStream(fs.createReadStream(key).pipe(res), callback)
-                when 'DELETE' then fs.unlink(key, callback)
+                    checkStream(req, callback).pipe(hasher).pipe(fs.createWriteStream(key))
+                when 'GET'
+                    checkStream(fs.createReadStream(key).pipe(hasher).pipe(res), callback)
+                when 'DELETE'
+                    fs.unlink(key, callback)
         ).done()
 
 class PigpenApi
@@ -127,7 +161,6 @@ class PigpenApi
         key = response['key']
         auth = response['auth']
         reqStream = request[method.toLowerCase()]({url:url, headers:{'x-pigpen-auth': auth}})
-        sz = 0
         deferred = Q.defer();
         reqStream.completionPromise = deferred.promise
         callback = (err) =>
@@ -135,11 +168,8 @@ class PigpenApi
             status = if err then err else 'OK'
             okcb = -> if err then deferred.reject(err) else deferred.resolve()
             errcb = (fin_err) -> deferred.reject(fin_err)
-            @coord.req('fin_act', [method, key, auth, sz, hashobject.read(), status]).then(okcb, errcb)
+            @coord.req('fin_act', [method, key, auth, hashobject.getSize(), hashobject.getHash(), status]).then(okcb, errcb)
 
-        reqStream.on('data', (chunk) ->
-            log 'response? data chunk : ', chunk
-            sz += chunk.length)
         reqStream.on('end', (chunk) ->
             log 'end chunk : ', chunk
             callback())

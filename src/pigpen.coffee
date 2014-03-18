@@ -7,8 +7,9 @@ corepeer = require('./corepeer')
 
 require 'coffee-errors'
 
+
 #
-# coffee src/pigpen.coffee share '--accesskey=-g0pTWm5ScSARPMcOaiqgQ==.s-CtmORuWCv4X9aA99qg=='
+# coffee src/pigpen.coffee share '--accesskey=-g0pTWm5ScSARPMcOaiqgQ==.s-CtmO-qRuWCv4X9aA99qg=='
 #
 # echo 'hi there' | coffee src/pigpen.coffee put hi.txt '--accesskey=5Lx4bUWsSZ6-Y_yElPm9ow==.J99GvP1wTIOoW2Xy2dj8RA=='
 # 
@@ -71,8 +72,8 @@ getConfig = () ->
 #    process.exit(1)
 
 conf = getConfig()
-conf.shareExtPortMin ?= 40000
-conf.shareExtPortMax ?= 50000
+conf.shareExtPortMin ?= 10000
+conf.shareExtPortMax ?= 20000
 conf.sharePort ?= 45014
 conf.coordinatorUrl ?= 'http://pigpen.millstonecw.com:81/api'
 
